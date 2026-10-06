@@ -65,7 +65,12 @@ class Container:
         self.repo = Repository(create_session_factory(self.engine))
         self.embedder = embedder or create_embedder(settings)
         self.vector_index = vector_index or create_vector_index(settings)
-        self.memory = MemoryStore(self.repo, self.vector_index, self.embedder)
+        self.memory = MemoryStore(
+            self.repo,
+            self.vector_index,
+            self.embedder,
+            enabled=settings.long_term_memory_enabled,
+        )
         self.registry: ToolRegistry = build_default_registry()
         self.policy = RiskPolicy(settings)
         self.llm = llm or create_llm(settings)

@@ -25,6 +25,8 @@ class Settings(BaseSettings):
 
     # --- persistence ---------------------------------------------------------------
     database_url: str = "sqlite:///./data/orchestrator.db"
+    supply_chain_db_path: str = "./data/supply_chain.db"
+    long_term_memory_enabled: bool = False
     checkpointer: Literal["auto", "postgres", "sqlite", "memory"] = "auto"
     checkpoint_sqlite_path: str = "./data/checkpoints.db"
 
@@ -51,6 +53,7 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr | None = None
     openai_base_url: str | None = None
     openai_model: str = "gpt-5-mini"
+    openai_structured_mode: Literal["auto", "native", "json"] = "auto"
     supervisor_model: str | None = Field(
         default=None, description="Optional model override for the supervisor/router."
     )

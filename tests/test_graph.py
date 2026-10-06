@@ -37,6 +37,47 @@ def event_types(container: Container, run_id: str) -> list[str]:
     return [e.type for e in container.repo.list_events(run_id)]
 
 
+PART_INVENTORY_TASK = (
+    "What is the latest inventory for part HYD-08 at warehouse WH-1? Report units on hand, "
+    "reorder point, units reserved, units in transit, and the snapshot date used."
+)
+
+CUSTOMER_TRADE_TASK = (
+    "Summarize customer CUST-005's trading activity over the prior three months: number of "
+    "shipments, total quantity shipped, and total revenue."
+)
+
+
+def test_part_inventory_mock_completes(container: Container) -> None:
+    run_id = start(container, PART_INVENTORY_TASK)
+    run = get(container, run_id)
+    assert run.status == "completed"
+    audit = container.repo.list_audit(run_id=run_id)
+    assert len(audit) == 1
+    assert audit[0].action == "query_part_inventory"
+    assert audit[0].result is not None
+    assert audit[0].result["units_on_hand"] == 0
+    assert audit[0].result["snapshot_date"] == "2025-12-29"
+    answer = run.final_answer or ""
+    assert "HYD-08" in answer
+    assert "below reorder" in answer.lower() or "reorder point" in answer.lower()
+
+
+def test_customer_trade_mock_completes(container: Container) -> None:
+    run_id = start(container, CUSTOMER_TRADE_TASK)
+    run = get(container, run_id)
+    assert run.status == "completed"
+    audit = container.repo.list_audit(run_id=run_id)
+    assert len(audit) == 1
+    assert audit[0].action == "query_customer_trade_summary"
+    assert audit[0].result is not None
+    assert audit[0].result["shipment_count"] == 27
+    assert audit[0].result["total_revenue"] == 2575429.62
+    answer = run.final_answer or ""
+    assert "CUST-005" in answer
+    assert "27" in answer or "shipments=27" in answer.replace(" ", "")
+
+
 def test_simple_run_delegates_and_completes(container: Container) -> None:
     run_id = start(container, "Calculate 15% of 2,340 and add 12 * 49")
     run = get(container, run_id)

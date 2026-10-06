@@ -220,6 +220,20 @@ class Repository:
             )
             return bool(result.rowcount)  # type: ignore[attr-defined]
 
+    def update_pending_approval_args(
+        self, approval_id: str, args: dict[str, Any], *, payload: dict[str, Any] | None = None
+    ) -> bool:
+        values: dict[str, Any] = {"args": args}
+        if payload is not None:
+            values["payload"] = payload
+        with self._sf.begin() as s:
+            result = s.execute(
+                update(ApprovalRecord)
+                .where(ApprovalRecord.id == approval_id, ApprovalRecord.status == "pending")
+                .values(**values)
+            )
+            return bool(result.rowcount)  # type: ignore[attr-defined]
+
     # ------------------------------------------------------------------ memories
     def add_memory(
         self,

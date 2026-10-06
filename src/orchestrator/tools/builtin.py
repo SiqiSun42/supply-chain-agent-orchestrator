@@ -10,6 +10,20 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, field_validator
 
+from orchestrator.supply_chain import (
+    QueryCustomerTradeSummaryArgs,
+    QueryPartInventoryArgs,
+    QuerySupplierOffersArgs,
+    RecordReplenishmentChoiceArgs,
+    RequestReplenishmentApprovalArgs,
+    SubmitReplenishmentApprovalArgs,
+    query_customer_trade_summary_tool,
+    query_part_inventory_tool,
+    query_supplier_offers_tool,
+    record_replenishment_choice_tool,
+    request_replenishment_approval_tool,
+    submit_replenishment_for_approval_tool,
+)
 from orchestrator.tools.base import Tool, ToolContext, ToolError, ToolRegistry
 from orchestrator.tools.calculator import CalculatorError, evaluate
 from orchestrator.tools.knowledge import default_knowledge_base
@@ -82,6 +96,14 @@ class SendEmailArgs(BaseModel):
     to: str = Field(description="Recipient email address.")
     subject: str = Field(min_length=1, max_length=200)
     body: str = Field(min_length=1, max_length=10_000)
+    purpose: str | None = Field(default=None, max_length=64)
+    product_code: str | None = Field(default=None, max_length=32)
+    supplier_name: str | None = Field(default=None, max_length=32)
+    qty: int | None = Field(default=None, ge=1)
+    unit_price: float | None = None
+    lead_days: int | None = None
+    estimated_total: float | None = None
+    revision_count: int = Field(default=0, ge=0)
 
     @field_validator("to")
     @classmethod
@@ -131,6 +153,8 @@ def current_time(args: CurrentTimeArgs, ctx: ToolContext) -> dict[str, Any]:
 
 
 def save_memory(args: SaveMemoryArgs, ctx: ToolContext) -> dict[str, Any]:
+    if not ctx.settings.long_term_memory_enabled:
+        return {"status": "disabled", "memories": []}
     record = ctx.memory.add(ctx.user_id, args.content, kind=args.kind, source_run_id=ctx.run_id)
     if record is None:
         return {"status": "duplicate", "content": args.content}
@@ -138,6 +162,8 @@ def save_memory(args: SaveMemoryArgs, ctx: ToolContext) -> dict[str, Any]:
 
 
 def recall_memory(args: RecallMemoryArgs, ctx: ToolContext) -> dict[str, Any]:
+    if not ctx.settings.long_term_memory_enabled:
+        return {"memories": []}
     hits = ctx.memory.search(
         ctx.user_id, args.query, k=args.k, min_score=ctx.settings.memory_min_score
     )
@@ -185,6 +211,8 @@ def send_email(args: SendEmailArgs, ctx: ToolContext) -> dict[str, Any]:
         "message_id": _short_id("msg", ctx.run_id, args.to, args.subject),
         "to": args.to,
         "subject": args.subject,
+        "body": args.body,
+        "purpose": args.purpose,
         "simulated": True,
     }
 
@@ -234,6 +262,58 @@ def build_default_registry() -> ToolRegistry:
                 RecallMemoryArgs,
                 recall_memory,
                 tags=("memory",),
+            ),
+            Tool(
+                "query_part_inventory",
+                "Required for Meridian part stock questions: latest inventory snapshot for one "
+                "product_code at one warehouse_name (units on hand, reorder point, reserved, "
+                "in transit, snapshot date). Call once with codes taken from the user task.",
+                QueryPartInventoryArgs,
+                query_part_inventory_tool,
+                tags=("ops",),
+            ),
+            Tool(
+                "query_customer_trade_summary",
+                "Required for Meridian customer trade questions: outbound shipments over the "
+                "last N months (shipment count, total quantity shipped, total revenue). Call once "
+                "with customer_name and months from the user task.",
+                QueryCustomerTradeSummaryArgs,
+                query_customer_trade_summary_tool,
+                tags=("ops",),
+            ),
+            Tool(
+                "query_supplier_offers",
+                "List supplier-side available inventory rows for a product code from supplier_offer.",
+                QuerySupplierOffersArgs,
+                query_supplier_offers_tool,
+                tags=("ops",),
+            ),
+            Tool(
+                "request_replenishment_approval",
+                "Submit replenishment supplier options for leadership approval.",
+                RequestReplenishmentApprovalArgs,
+                request_replenishment_approval_tool,
+                risk="medium",
+                sensitive=True,
+                tags=("ops",),
+            ),
+            Tool(
+                "submit_replenishment_for_approval",
+                "Check inventory and supplier offers, build a replenishment leadership approval "
+                "package, and pause for human approval. Pass product_code, warehouse_name, and "
+                "qty_needed only.",
+                SubmitReplenishmentApprovalArgs,
+                submit_replenishment_for_approval_tool,
+                risk="medium",
+                sensitive=True,
+                tags=("ops",),
+            ),
+            Tool(
+                "record_replenishment_choice",
+                "Record the leadership-selected replenishment supplier and quantity.",
+                RecordReplenishmentChoiceArgs,
+                record_replenishment_choice_tool,
+                tags=("ops",),
             ),
             Tool(
                 "lookup_order",

@@ -17,6 +17,8 @@ def list_memories(
     q: str | None = Query(default=None, max_length=500, description="Semantic search query."),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[MemoryOut]:
+    if not c.settings.long_term_memory_enabled:
+        return []
     if q and q.strip():
         hits = c.memory.search(user_id, q, k=min(limit, 50), min_score=0.0)
         return [MemoryOut.of(record, score) for record, score in hits]
@@ -25,6 +27,8 @@ def list_memories(
 
 @router.post("", status_code=status.HTTP_201_CREATED, response_model=MemoryOut)
 def create_memory(body: MemoryCreate, c: ContainerDep) -> MemoryOut:
+    if not c.settings.long_term_memory_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Long-term memory is disabled")
     record = c.memory.add(body.user_id, body.content, kind=body.kind)
     if record is None:
         raise HTTPException(409, "An identical memory already exists")

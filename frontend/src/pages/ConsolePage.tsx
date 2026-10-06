@@ -14,11 +14,21 @@ import { useUser } from "../lib/user";
 
 const EXAMPLES = [
   {
-    label: "Refund + email (needs approval)",
-    task: "My name is Dana and I prefer concise answers. Order ORD-1042 arrived damaged - please refund $250 and email me at dana@example.com to confirm.",
+    label: "Part stock: HYD-08 @ WH-1",
+    task: "What is the latest inventory for part HYD-08 at warehouse WH-1? Report units on hand, reorder point, units reserved, units in transit, and the snapshot date used.",
   },
-  { label: "Math + research", task: "Calculate 15% of 2,340 and add 12 * 49. Also, what does the Pro plan include?" },
-  { label: "Policy summary", task: "Research our refund and escalation policy and write a short summary for the support team." },
+  {
+    label: "Customer trades: CUST-005 (3 mo)",
+    task: "Summarize customer CUST-005's trading activity over the prior three months: number of shipments, total quantity shipped, and total revenue.",
+  },
+  {
+    label: "Replenish HYD-08: leadership approval",
+    task: "Part HYD-08 at warehouse WH-1 is below reorder point. Replenish 200 units for leadership approval.",
+  },
+  {
+    label: "PO to procurement: SUP-01 x 1000",
+    task: "Place a purchase order for 1000 units of HYD-08 from supplier SUP-01 and send it to procurement for release.",
+  },
   { label: "Escalate to a manager", task: "I want to speak to a manager about my cancelled order ORD-1003." },
   { label: "Low confidence review", task: "Forecast next quarter's churn for the Pro plan." },
   { label: "Memory recall", task: "Write a short welcome note for me." },

@@ -1,0 +1,5 @@
+carrier_id,carrier_name,mode,cost_per_kg,avg_transit_days,co2_kg_per_km,reliability_score
+1,CARR-1,Road,0.4,3,0.12,0.86
+2,CARR-2,Rail,0.25,5,0.03,0.88
+3,CARR-3,Air,2.5,1,0.6,0.92
+4,CARR-4,Sea,0.15,14,0.01,0.92

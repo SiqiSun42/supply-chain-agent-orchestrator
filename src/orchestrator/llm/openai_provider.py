@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import Any, Literal
 
 import openai
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from orchestrator.llm.base import (
     LLMError,
@@ -19,15 +19,44 @@ from orchestrator.llm.base import (
     ToolSpec,
     Usage,
 )
+from orchestrator.llm.json_parse import parse_json_object
+from orchestrator.llm.messages import repair_messages_for_tool_api
+
+StructuredMode = Literal["auto", "native", "json"]
 
 
-def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, Any]]:
+def reasoning_content_from_message(msg: Message) -> str:
+    if msg.raw:
+        for block in msg.raw:
+            if isinstance(block, dict) and "reasoning_content" in block:
+                return str(block.get("reasoning_content") or "")
+    return ""
+
+
+def capture_assistant_extras(choice: Any) -> list[dict[str, Any]] | None:
+    reasoning = getattr(choice, "reasoning_content", None)
+    model_dump = getattr(choice, "model_dump", None)
+    if reasoning is None and callable(model_dump):
+        reasoning = model_dump(exclude_none=False).get("reasoning_content")
+    if reasoning is None:
+        return None
+    return [{"reasoning_content": reasoning}]
+
+
+def to_openai_messages(
+    system: str,
+    messages: list[Message],
+    *,
+    reasoning_compat: bool = False,
+) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = [{"role": "system", "content": system}]
     for msg in messages:
         if msg.role == "user":
             out.append({"role": "user", "content": msg.content})
         elif msg.role == "assistant":
             item: dict[str, Any] = {"role": "assistant", "content": msg.content or None}
+            if reasoning_compat:
+                item["reasoning_content"] = reasoning_content_from_message(msg)
             if msg.tool_calls:
                 item["tool_calls"] = [
                     {
@@ -43,6 +72,13 @@ def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, A
     return out
 
 
+def _is_openai_official_base_url(base_url: str | None) -> bool:
+    if not base_url:
+        return True
+    normalized = base_url.lower().rstrip("/")
+    return "api.openai.com" in normalized
+
+
 class OpenAIProvider(LLMProvider):
     name = "openai"
 
@@ -55,11 +91,20 @@ class OpenAIProvider(LLMProvider):
         base_url: str | None = None,
         max_tokens: int = 4096,
         timeout: float = 120.0,
+        structured_mode: StructuredMode = "auto",
         client: Any | None = None,
     ) -> None:
         super().__init__(model, supervisor_model)
         self.max_tokens = max_tokens
+        self.base_url = base_url
+        self.structured_mode = structured_mode
+        self._compat_api = not _is_openai_official_base_url(base_url)
         self.client = client or openai.OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+
+    def _token_limit_kwargs(self) -> dict[str, int]:
+        if self._compat_api:
+            return {"max_tokens": self.max_tokens}
+        return {"max_completion_tokens": self.max_tokens}
 
     def _call(self, fn: Any, **kwargs: Any) -> tuple[Any, float]:
         start = time.perf_counter()
@@ -83,6 +128,83 @@ class OpenAIProvider(LLMProvider):
             output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
         )
 
+    @staticmethod
+    def _is_response_format_error(exc: LLMError) -> bool:
+        msg = str(exc).lower()
+        return "response_format" in msg or "json_schema" in msg
+
+    def _structured_native[T: BaseModel](
+        self,
+        *,
+        system: str,
+        messages: list[Message],
+        schema: type[T],
+        model: str,
+    ) -> tuple[T, LLMResponse]:
+        response, latency = self._call(
+            self.client.chat.completions.parse,
+            model=model,
+            messages=to_openai_messages(system, messages, reasoning_compat=self._compat_api),
+            response_format=schema,
+            **self._token_limit_kwargs(),
+        )
+        message = response.choices[0].message
+        if getattr(message, "refusal", None):
+            raise LLMError(f"The model refused: {message.refusal}")
+        parsed = message.parsed
+        if parsed is None:
+            raise LLMError(f"Model did not return a valid {schema.__name__}")
+        meta = LLMResponse(
+            content=parsed.model_dump_json(),
+            usage=self._usage(response),
+            model=model,
+            latency_ms=latency,
+        )
+        return parsed, meta
+
+    def _uses_json_object_response_format(self) -> bool:
+        if self._compat_api:
+            return True
+        return self.structured_mode in ("json", "auto")
+
+    def _structured_json[T: BaseModel](
+        self,
+        *,
+        system: str,
+        messages: list[Message],
+        schema: type[T],
+        model: str,
+    ) -> tuple[T, LLMResponse]:
+        schema_hint = json.dumps(schema.model_json_schema(), ensure_ascii=False)
+        system_json = (
+            f"{system}\n\n"
+            f"Respond with a single JSON object (json output, no markdown fences). "
+            f"The object must validate against this JSON schema:\n"
+            f"{schema_hint}"
+        )
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": to_openai_messages(
+                system_json, messages, reasoning_compat=self._compat_api
+            ),
+            **self._token_limit_kwargs(),
+            "response_format": {"type": "json_object"},
+        }
+        response, latency = self._call(self.client.chat.completions.create, **kwargs)
+        message = response.choices[0].message
+        content = (message.content or "").strip()
+        try:
+            parsed = schema.model_validate(parse_json_object(content))
+        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            raise LLMError(f"Model did not return valid JSON: {exc}") from exc
+        meta = LLMResponse(
+            content=parsed.model_dump_json(),
+            usage=self._usage(response),
+            model=model,
+            latency_ms=latency,
+        )
+        return parsed, meta
+
     def chat(
         self,
         *,
@@ -92,10 +214,13 @@ class OpenAIProvider(LLMProvider):
         context: PromptContext,
     ) -> LLMResponse:
         model = self.model_for(context.agent)
+        safe_messages = repair_messages_for_tool_api(messages)
         kwargs: dict[str, Any] = {
             "model": model,
-            "messages": to_openai_messages(system, messages),
-            "max_completion_tokens": self.max_tokens,
+            "messages": to_openai_messages(
+                system, safe_messages, reasoning_compat=self._compat_api
+            ),
+            **self._token_limit_kwargs(),
         }
         if tools:
             kwargs["tools"] = [
@@ -124,6 +249,7 @@ class OpenAIProvider(LLMProvider):
             usage=self._usage(response),
             model=model,
             latency_ms=latency,
+            raw=capture_assistant_extras(choice),
         )
 
     def structured[T: BaseModel](
@@ -135,23 +261,21 @@ class OpenAIProvider(LLMProvider):
         context: PromptContext,
     ) -> tuple[T, LLMResponse]:
         model = self.model_for(context.agent)
-        response, latency = self._call(
-            self.client.chat.completions.parse,
-            model=model,
-            messages=to_openai_messages(system, messages),
-            response_format=schema,
-            max_completion_tokens=self.max_tokens,
-        )
-        message = response.choices[0].message
-        if getattr(message, "refusal", None):
-            raise LLMError(f"The model refused: {message.refusal}")
-        parsed = message.parsed
-        if parsed is None:
-            raise LLMError(f"Model did not return a valid {schema.__name__}")
-        meta = LLMResponse(
-            content=parsed.model_dump_json(),
-            usage=self._usage(response),
-            model=model,
-            latency_ms=latency,
-        )
-        return parsed, meta
+        if self._uses_json_object_response_format():
+            return self._structured_json(
+                system=system, messages=messages, schema=schema, model=model
+            )
+        if self.structured_mode == "native":
+            return self._structured_native(
+                system=system, messages=messages, schema=schema, model=model
+            )
+        try:
+            return self._structured_native(
+                system=system, messages=messages, schema=schema, model=model
+            )
+        except LLMError as exc:
+            if self._is_response_format_error(exc):
+                return self._structured_json(
+                    system=system, messages=messages, schema=schema, model=model
+                )
+            raise

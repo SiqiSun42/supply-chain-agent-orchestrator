@@ -55,7 +55,7 @@ export interface ThreadDetail {
   checkpoint_id: string | null;
 }
 
-export type ApprovalKind = "tool" | "escalation" | "final_review";
+export type ApprovalKind = "tool" | "escalation" | "final_review" | "procurement_choice";
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "edited";
 
 export interface Approval {
@@ -78,9 +78,12 @@ export interface Approval {
 }
 
 export interface DecisionInput {
-  decision: "approve" | "reject" | "edit";
+  decision: "approve" | "reject" | "edit" | "revise";
   args?: Record<string, unknown>;
   response?: string;
+  selected_option_id?: string;
+  selected_plan_id?: string;
+  other_plan_text?: string;
   comment?: string;
   reviewer?: string;
 }

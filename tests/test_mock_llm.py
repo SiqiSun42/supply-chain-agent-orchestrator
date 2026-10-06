@@ -2,7 +2,44 @@ from __future__ import annotations
 
 from orchestrator.agents.contracts import MemoryExtraction, RouteDecision
 from orchestrator.llm.base import Message, PromptContext
-from orchestrator.llm.mock import MockProvider, extract_expressions, plan_agents
+from orchestrator.llm.mock import (
+    MockProvider,
+    extract_expressions,
+    is_customer_trade_task,
+    is_part_inventory_task,
+    is_replenishment_task,
+    plan_agents,
+    replenishment_qty,
+)
+
+
+def test_plan_agents_part_inventory_ops_only() -> None:
+    task = (
+        "What is the latest inventory for part HYD-08 at warehouse WH-1? "
+        "Report units on hand and reorder point."
+    )
+    assert is_part_inventory_task(task)
+    assert plan_agents(task) == ["ops"]
+
+
+def test_plan_agents_replenishment_ops_only() -> None:
+    task = (
+        "Part HYD-08 at warehouse WH-1 is below reorder point. "
+        "Replenish 200 units for leadership approval."
+    )
+    assert is_replenishment_task(task)
+    assert not is_part_inventory_task(task)
+    assert plan_agents(task) == ["ops"]
+    assert replenishment_qty(task) == 200
+
+
+def test_plan_agents_customer_trade_ops_only() -> None:
+    task = (
+        "Summarize customer CUST-005's trading activity over the prior three months: "
+        "number of shipments and total revenue."
+    )
+    assert is_customer_trade_task(task)
+    assert plan_agents(task) == ["ops"]
 
 
 def test_plan_agents_orders_specialists() -> None:

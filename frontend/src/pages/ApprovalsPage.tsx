@@ -18,11 +18,12 @@ export function ApprovalsPage() {
       <PageHeader
         title="Approvals inbox"
         subtitle="Runs pause here when the risk policy requires a human: large refunds, outbound email, explicit escalations and low-confidence answers."
-        actions={
-          <div className="flex rounded-lg bg-slate-100 p-1 text-sm">
+        tabs={
+          <div className="inline-flex rounded-lg bg-slate-100 p-1 text-sm">
             {(["pending", "history"] as const).map((t) => (
               <button
                 key={t}
+                type="button"
                 onClick={() => setTab(t)}
                 className={clsx("rounded-md px-3 py-1 font-medium capitalize", tab === t ? "bg-white text-slate-900 shadow-sm" : "text-slate-500")}
               >

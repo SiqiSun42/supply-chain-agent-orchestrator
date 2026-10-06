@@ -30,10 +30,18 @@ def content_hash(content: str) -> str:
 
 
 class MemoryStore:
-    def __init__(self, repo: Repository, index: VectorIndex, embedder: Embedder) -> None:
+    def __init__(
+        self,
+        repo: Repository,
+        index: VectorIndex,
+        embedder: Embedder,
+        *,
+        enabled: bool = True,
+    ) -> None:
         self.repo = repo
         self.index = index
         self.embedder = embedder
+        self.enabled = enabled
 
     def add(
         self,
@@ -44,6 +52,8 @@ class MemoryStore:
         source_run_id: str | None = None,
     ) -> MemoryRecord | None:
         """Persist and index a memory. Returns None for duplicates."""
+        if not self.enabled:
+            return None
         content = content.strip()
         if not content:
             return None
@@ -69,6 +79,8 @@ class MemoryStore:
     def search(
         self, user_id: str, query: str, *, k: int = 5, min_score: float = 0.0
     ) -> list[tuple[MemoryRecord, float]]:
+        if not self.enabled:
+            return []
         hits = self.index.query(self.embedder.embed_one(query), user_id, k)
         hits = [h for h in hits if h.score >= min_score]
         records = {r.id: r for r in self.repo.get_memories([h.id for h in hits])}
@@ -78,6 +90,8 @@ class MemoryStore:
         self, user_id: str, query: str, *, k: int, profile_k: int, min_score: float
     ) -> list[RecalledMemory]:
         """Semantic top-k plus the user's most recent profile/preference memories."""
+        if not self.enabled:
+            return []
         recalled: dict[str, RecalledMemory] = {}
         for record in self.repo.list_memories(
             user_id, kinds=("profile", "preference"), limit=profile_k
@@ -90,6 +104,8 @@ class MemoryStore:
     def list_for_user(
         self, user_id: str, *, limit: int = 100, offset: int = 0
     ) -> list[MemoryRecord]:
+        if not self.enabled:
+            return []
         return list(self.repo.list_memories(user_id, limit=limit, offset=offset))
 
     def delete(self, memory_id: str) -> bool:

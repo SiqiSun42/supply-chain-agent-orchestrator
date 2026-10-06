@@ -13,11 +13,13 @@ build/
 
 # Local data (SQLite, checkpoints, Chroma)
 data/
+spec/
 
 # Environment
 .env
 .env.*
 !.env.example
+.cursorindexingignore
 
 # Frontend
 frontend/node_modules/

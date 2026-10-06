@@ -12,7 +12,12 @@ class RouteDecision(BaseModel):
 
     next: str = Field(description="Name of the worker agent to call next, or FINISH when done.")
     instructions: str = Field(
-        default="", description="Concrete instructions for the selected worker agent."
+        default="",
+        description=(
+            "Concrete instructions for the selected worker agent. For ops supply chain reads, "
+            "state which tool to call and exact arguments (product_code, warehouse_name, "
+            "customer_name, months) copied from the user task."
+        ),
     )
     reasoning: str = Field(default="", description="One or two sentences explaining the choice.")
 

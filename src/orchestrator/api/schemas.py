@@ -145,7 +145,7 @@ class ApprovalOut(BaseModel):
 
 
 class DecisionIn(BaseModel):
-    decision: Literal["approve", "reject", "edit"]
+    decision: Literal["approve", "reject", "edit", "revise"]
     args: dict[str, Any] | None = Field(
         default=None, description="Replacement tool arguments (decision=edit, tool approvals)."
     )
@@ -153,6 +153,21 @@ class DecisionIn(BaseModel):
         default=None,
         max_length=8000,
         description="Reply to an escalation, or the edited final answer (final_review).",
+    )
+    selected_option_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Chosen replenishment option id (procurement_choice approvals).",
+    )
+    selected_plan_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Alternative plan_id after rejecting the recommended plan.",
+    )
+    other_plan_text: str | None = Field(
+        default=None,
+        max_length=4000,
+        description="Free-text procurement plan when no listed alternative fits.",
     )
     comment: str | None = Field(default=None, max_length=2000)
     reviewer: str = Field(default="reviewer", min_length=1, max_length=128)

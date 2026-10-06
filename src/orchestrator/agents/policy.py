@@ -8,7 +8,7 @@ from typing import Any, Literal
 from orchestrator.config import Settings
 from orchestrator.tools.base import RiskLevel, Tool
 
-ApprovalKind = Literal["tool", "escalation", "final_review"]
+ApprovalKind = Literal["tool", "escalation", "final_review", "procurement_choice"]
 
 
 @dataclass(frozen=True)
@@ -42,10 +42,19 @@ class RiskPolicy:
                 )
             return PolicyDecision(False, risk_level="medium")
         if tool.name == "send_email" and self.email_requires_approval:
+            if args.get("purpose") == "purchase_order_dispatch":
+                reason = (
+                    f"Purchase order email to {args.get('to')} requires approval before sending. "
+                    f"{args.get('qty')} x {args.get('product_code')} from {args.get('supplier_name')}."
+                )
+            else:
+                reason = f"Outbound email to {args.get('to', 'a customer')} needs review."
+            return PolicyDecision(True, "tool", reason, "medium")
+        if tool.name in ("request_replenishment_approval", "submit_replenishment_for_approval"):
             return PolicyDecision(
                 True,
-                "tool",
-                f"Outbound email to {args.get('to', 'a customer')} needs review.",
+                "procurement_choice",
+                str(args.get("reason") or args.get("summary") or "Replenishment needs leadership approval."),
                 "medium",
             )
         return PolicyDecision(False, risk_level=tool.risk)

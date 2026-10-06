@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
@@ -25,9 +26,12 @@ from orchestrator.agents.tooling import ToolExecutor
 from orchestrator.config import Settings
 from orchestrator.db.repository import Repository
 from orchestrator.llm.base import LLMError, LLMProvider, Message, PromptContext, ToolCall
+from orchestrator.llm.messages import normalize_tool_scratch
 from orchestrator.memory.store import MemoryStore
 from orchestrator.observability import get_logger
 from orchestrator.runtime.events import RunEmitter
+from orchestrator.supply_chain import build_replenishment_approval_args
+from orchestrator.supply_chain.tools import RequestReplenishmentApprovalArgs
 from orchestrator.tools.base import ToolContext, ToolRegistry, format_validation_error
 
 log = get_logger(__name__)
@@ -63,6 +67,7 @@ class Decision(TypedDict, total=False):
     response: str | None
     comment: str | None
     reviewer: str
+    selected_option_id: str
 
 
 @dataclass
@@ -125,6 +130,39 @@ def _dump_scratch(scratch: list[Message]) -> list[dict[str, Any]]:
     return [m.model_dump(mode="json") for m in scratch]
 
 
+def _trim_assistant_tool_calls(scratch: list[Message], keep_call_id: str) -> None:
+    if not scratch:
+        return
+    last = scratch[-1]
+    if last.role != "assistant" or not last.tool_calls:
+        return
+    kept = [c for c in last.tool_calls if c.id == keep_call_id]
+    if not kept:
+        kept = [last.tool_calls[0]]
+    scratch[-1] = Message(
+        role="assistant",
+        content=last.content,
+        tool_calls=kept,
+        raw=last.raw,
+    )
+
+
+def _ensure_assistant_tool_call(scratch: list[Message], call: ToolCall) -> None:
+    if scratch and scratch[-1].role == "assistant":
+        last = scratch[-1]
+        if any(c.id == call.id for c in last.tool_calls):
+            return
+        merged = [*last.tool_calls, call]
+        scratch[-1] = Message(
+            role="assistant",
+            content=last.content,
+            tool_calls=merged,
+            raw=last.raw,
+        )
+        return
+    scratch.append(Message(role="assistant", content="", tool_calls=[call]))
+
+
 # ----------------------------------------------------------------------------- builder
 def build_graph(
     deps: GraphDeps, checkpointer: BaseCheckpointSaver[Any] | None = None
@@ -153,6 +191,24 @@ def build_graph(
                 scratch.append(prepared)
                 continue
             tool, args = prepared
+            effective_call = call
+            if tool.name == "submit_replenishment_for_approval":
+                built = build_replenishment_approval_args(
+                    str(args.product_code),
+                    str(args.warehouse_name),
+                    int(args.qty_needed),
+                    db_path=ctx.settings.supply_chain_db_path,
+                )
+                req_tool = deps.registry.get("request_replenishment_approval")
+                if req_tool is None:
+                    raise RuntimeError("request_replenishment_approval missing from registry")
+                args = RequestReplenishmentApprovalArgs.model_validate(built)
+                tool = req_tool
+                effective_call = ToolCall(
+                    id=call.id,
+                    name=req_tool.name,
+                    args=args.model_dump(mode="json"),
+                )
             decision = deps.policy.evaluate_tool(tool, args.model_dump())
             if decision.requires_approval:
                 return {
@@ -160,7 +216,7 @@ def build_graph(
                     "agent": spec.name,
                     "tool": tool.name,
                     "tool_description": tool.description,
-                    "call": call.model_dump(),
+                    "call": effective_call.model_dump(),
                     "args": args.model_dump(mode="json"),
                     "reason": decision.reason,
                     "risk_level": decision.risk_level,
@@ -275,7 +331,7 @@ def build_graph(
         tool_specs = [t.spec() for t in deps.registry.subset(spec.tools)]
 
         def worker(state: AgentState) -> Command[Any]:
-            scratch = _load_scratch(state)
+            scratch = normalize_tool_scratch(_load_scratch(state))
             instructions = state.get("instructions", "")
             if not scratch:
                 emitter.emit("agent_started", spec.name, instructions=instructions)
@@ -311,6 +367,8 @@ def build_graph(
                     emitter.emit("agent_message", spec.name, text=response.content)
                 pending = run_calls(state, spec, response.tool_calls, scratch)
                 if pending is not None:
+                    pending_call = ToolCall.model_validate(pending["call"])
+                    _trim_assistant_tool_calls(scratch, pending_call.id)
                     return Command(
                         goto="human_review",
                         update={"scratch": _dump_scratch(scratch), "pending_action": pending},
@@ -350,6 +408,9 @@ def build_graph(
         reviewer = raw_decision.get("reviewer") or "reviewer"
         comment = raw_decision.get("comment") or ""
 
+        if raw_decision.get("approval_args"):
+            pending = {**pending, "args": raw_decision["approval_args"]}
+
         if pending["kind"] == "final_review":
             answer = state.get("final_answer") or ""
             if choice == "edit" and raw_decision.get("response"):
@@ -366,6 +427,8 @@ def build_graph(
         ctx = tool_ctx(state, agent)
         scratch = _load_scratch(state)
         call = ToolCall.model_validate(pending["call"])
+        skip_record_in_remaining = False
+        _ensure_assistant_tool_call(scratch, call)
 
         if pending["kind"] == "escalation":
             answered = choice != "reject"
@@ -379,13 +442,137 @@ def build_graph(
                     ctx, call, pending["args"], payload, "approved" if answered else "rejected"
                 )
             )
+        elif pending["kind"] == "procurement_choice":
+            if choice == "reject":
+                payload = {"status": "rejected_by_human", "comment": comment, "reviewer": reviewer}
+                scratch.append(
+                    executor.record_human(ctx, call, pending["args"], payload, "rejected")
+                )
+            else:
+                rec = pending["args"].get("recommended_plan") or {}
+                rec_plan_id = str(rec.get("plan_id") or "")
+                if rec.get("source") == "other" or rec_plan_id == "rec-custom":
+                    scratch.append(
+                        executor.record_human(
+                            ctx,
+                            call,
+                            pending["args"],
+                            {
+                                "status": "recorded",
+                                "message": (
+                                    f"Leadership approved custom plan: {rec.get('summary', '')}"
+                                ),
+                                "plan": rec,
+                                "reviewer": reviewer,
+                            },
+                            "approved",
+                        )
+                    )
+                elif rec_plan_id == "rec-split" or "Split" in str(rec.get("title", "")):
+                    scratch.append(
+                        executor.record_human(
+                            ctx,
+                            call,
+                            pending["args"],
+                            {
+                                "status": "recorded",
+                                "message": f"Leadership approved split plan: {rec.get('summary', '')}",
+                                "plan": rec,
+                                "reviewer": reviewer,
+                            },
+                            "approved",
+                        )
+                    )
+                else:
+                    option_id = raw_decision.get("selected_option_id") or ""
+                    if not option_id:
+                        if rec_plan_id.startswith("rec-"):
+                            option_id = rec_plan_id.removeprefix("rec-")
+                        if not option_id:
+                            option_id = str(pending["args"].get("recommended_option_id") or "")
+                    options = pending["args"].get("options") or []
+                    selected = next(
+                        (o for o in options if str(o.get("option_id")) == option_id),
+                        None,
+                    )
+                    if not selected:
+                        scratch.append(
+                            executor.record_human(
+                                ctx,
+                                call,
+                                pending["args"],
+                                {
+                                    "error": "A feasible supplier option must be selected.",
+                                    "reviewer": reviewer,
+                                },
+                                "error",
+                            )
+                        )
+                    else:
+                        scratch.append(
+                            executor.record_human(
+                                ctx,
+                                call,
+                                pending["args"],
+                                {
+                                    "status": "approved_by_leadership",
+                                    "option_id": option_id,
+                                    "reviewer": reviewer,
+                                },
+                                "approved",
+                            )
+                        )
+                        record_tool = deps.registry.get("record_replenishment_choice")
+                        if record_tool is None:
+                            raise RuntimeError("record_replenishment_choice missing from registry")
+                        record_args = record_tool.validate(
+                            {
+                                "option_id": selected["option_id"],
+                                "supplier_id": selected["supplier_id"],
+                                "supplier_name": selected["supplier_name"],
+                                "product_code": selected["product_code"],
+                                "warehouse_name": pending["args"]["warehouse_name"],
+                                "qty_to_order": selected["qty_to_order"],
+                                "unit_price": selected["unit_price"],
+                                "lead_days": selected["lead_days"],
+                            }
+                        )
+                        remaining_raw = pending.get("remaining") or []
+                        record_from_remaining = next(
+                            (
+                                ToolCall.model_validate(c)
+                                for c in remaining_raw
+                                if c.get("name") == "record_replenishment_choice"
+                            ),
+                            None,
+                        )
+                        record_call = ToolCall(
+                            id=(
+                                record_from_remaining.id
+                                if record_from_remaining is not None
+                                else f"{call.id}:record"
+                            ),
+                            name="record_replenishment_choice",
+                            args=record_args.model_dump(),
+                        )
+                        record_msg = executor.run(
+                            ctx, record_tool, record_call, record_args, approved_by=reviewer
+                        )
+                        try:
+                            record_payload = json.loads(record_msg.content)
+                        except json.JSONDecodeError:
+                            record_payload = {"message": record_msg.content}
+                        summary = str(record_payload.get("message") or record_msg.content)
+                        scratch.append(Message(role="assistant", content=summary))
+                        skip_record_in_remaining = True
         elif choice in ("approve", "edit"):
             tool = deps.registry.get(pending["tool"])
             args = raw_decision.get("args") if choice == "edit" else None
+            effective_args = args if args is not None else pending["args"]
             if tool is None:  # pragma: no cover - registry is static
                 raise RuntimeError(f"Tool {pending['tool']} disappeared from the registry")
             try:
-                validated = tool.validate(args or pending["args"])
+                validated = tool.validate(effective_args)
                 scratch.append(executor.run(ctx, tool, call, validated, approved_by=reviewer))
             except ValidationError as exc:
                 scratch.append(
@@ -402,14 +589,23 @@ def build_graph(
             scratch.append(executor.record_human(ctx, call, pending["args"], payload, "rejected"))
 
         remaining = [ToolCall.model_validate(c) for c in pending.get("remaining", [])]
+        if pending.get("kind") == "procurement_choice" and choice != "reject":
+            remaining = [c for c in remaining if c.name != "record_replenishment_choice"]
+        elif skip_record_in_remaining:
+            remaining = [c for c in remaining if c.name != "record_replenishment_choice"]
         next_pending = run_calls(state, spec, remaining, scratch)
+        if next_pending is not None:
+            pending_call = ToolCall.model_validate(next_pending["call"])
+            _trim_assistant_tool_calls(scratch, pending_call.id)
+        normalized = normalize_tool_scratch(scratch)
         if next_pending is not None:
             return Command(
                 goto="human_review",
-                update={"scratch": _dump_scratch(scratch), "pending_action": next_pending},
+                update={"scratch": _dump_scratch(normalized), "pending_action": next_pending},
             )
         return Command(
-            goto=agent, update={"scratch": _dump_scratch(scratch), "pending_action": None}
+            goto=agent,
+            update={"scratch": _dump_scratch(normalized), "pending_action": None},
         )
 
     def finalize(state: AgentState) -> Command[Any]:
@@ -439,25 +635,28 @@ def build_graph(
 
     def memorize(state: AgentState) -> dict[str, Any]:
         saved: list[dict[str, Any]] = []
-        try:
-            extraction, meta = llm.structured(
-                system=MEMORY_PROMPT,
-                messages=[Message(role="user", content=state["task"])],
-                schema=MemoryExtraction,
-                context=_context(state, "memory"),
-            )
-            emitter.llm_call("memory", meta, "extract_memories")
-            for item in extraction.memories[:5]:
-                record = deps.memory.add(
-                    state["user_id"],
-                    item.content,
-                    kind=item.kind,
-                    source_run_id=state.get("run_id"),
+        if settings.long_term_memory_enabled:
+            try:
+                extraction, meta = llm.structured(
+                    system=MEMORY_PROMPT,
+                    messages=[Message(role="user", content=state["task"])],
+                    schema=MemoryExtraction,
+                    context=_context(state, "memory"),
                 )
-                if record is not None:
-                    saved.append({"id": record.id, "content": record.content, "kind": record.kind})
-        except LLMError as exc:  # memory is best-effort; never fail a finished run over it
-            log.warning("memory_extraction_failed", error=str(exc))
+                emitter.llm_call("memory", meta, "extract_memories")
+                for item in extraction.memories[:5]:
+                    record = deps.memory.add(
+                        state["user_id"],
+                        item.content,
+                        kind=item.kind,
+                        source_run_id=state.get("run_id"),
+                    )
+                    if record is not None:
+                        saved.append(
+                            {"id": record.id, "content": record.content, "kind": record.kind}
+                        )
+            except LLMError as exc:  # memory is best-effort; never fail a finished run over it
+                log.warning("memory_extraction_failed", error=str(exc))
         emitter.emit("memory_saved", "memory", memories=saved)
         turn = {
             "role": "assistant",

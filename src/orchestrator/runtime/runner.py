@@ -63,6 +63,8 @@ class RunService:
                 if approval is None or approval.decision is None:
                     raise RuntimeError(f"Approval {approval_id} has no recorded decision")
                 decision = dict(approval.decision)
+                if approval.args and approval.kind in ("procurement_choice", "tool"):
+                    decision["approval_args"] = approval.args
                 emitter.emit(
                     "run_resumed", approval.agent, approval_id=approval_id, decision=decision
                 )

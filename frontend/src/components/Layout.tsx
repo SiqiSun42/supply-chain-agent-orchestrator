@@ -1,5 +1,5 @@
 import clsx from "clsx";
-import { Brain, History, Inbox, MessagesSquare, Network, UserRound } from "lucide-react";
+import { AlarmClock, History, Inbox, MessagesSquare, Network, UserRound } from "lucide-react";
 import { useEffect, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 
@@ -11,7 +11,7 @@ import { useUser } from "../lib/user";
 const NAV = [
   { to: "/", label: "Console", icon: MessagesSquare, end: true },
   { to: "/approvals", label: "Approvals", icon: Inbox },
-  { to: "/memory", label: "Memory", icon: Brain },
+  { to: "/alarms", label: "Alarms", icon: AlarmClock },
   { to: "/runs", label: "Run history", icon: History },
 ];
 
@@ -37,7 +37,7 @@ export function Layout() {
           </div>
           <div>
             <div className="text-sm font-semibold text-slate-900">Agent Orchestrator</div>
-            <div className="text-[11px] text-slate-400">LangGraph · HITL · Memory</div>
+            <div className="text-[11px] text-slate-400">LangGraph · HITL · Alarms</div>
           </div>
         </div>
         <nav className="space-y-0.5 px-3">

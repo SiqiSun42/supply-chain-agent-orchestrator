@@ -147,9 +147,11 @@ export function Answer({ text }: { text: string }) {
   return (
     <div className="space-y-3 text-sm leading-relaxed text-slate-700">
       {blocks.map((block, bi) => {
-        const lines = block.split("\n");
-        const bullets = lines.filter((l) => l.startsWith("- "));
-        const head = lines.filter((l) => !l.startsWith("- "));
+        const lines = block.split("\n").filter((l) => l.length > 0);
+        const isBullet = (line: string) => /^\s*-\s/.test(line);
+        const bulletText = (line: string) => line.replace(/^\s*-\s+/, "");
+        const bullets = lines.filter(isBullet);
+        const head = lines.filter((l) => !isBullet(l));
         return (
           <div key={bi}>
             {head.map((line, li) => (
@@ -158,7 +160,7 @@ export function Answer({ text }: { text: string }) {
             {bullets.length > 0 && (
               <ul className="mt-1 list-disc space-y-1 pl-5 marker:text-slate-400">
                 {bullets.map((line, li) => (
-                  <li key={li}>{inline(line.slice(2))}</li>
+                  <li key={li}>{inline(bulletText(line))}</li>
                 ))}
               </ul>
             )}

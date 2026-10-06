@@ -31,6 +31,7 @@ def create_llm(settings: Settings) -> LLMProvider:
             model=settings.openai_model,
             supervisor_model=settings.supervisor_model,
             base_url=settings.openai_base_url,
+            structured_mode=settings.openai_structured_mode,
             max_tokens=settings.llm_max_tokens,
             timeout=settings.llm_timeout_seconds,
         )

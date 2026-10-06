@@ -21,6 +21,17 @@ _COMMON = (
     "Never invent tool results. If a tool returns an error, say so plainly."
 )
 
+_OPS_SUPPLY_READ = (
+    "Meridian supply chain read-only lookups (use these tools, not lookup_order or knowledge_search): "
+    "(1) Part inventory at a warehouse: call query_part_inventory once with the task's product_code "
+    "and warehouse_name (hyphenated codes such as HYD-08 and WH-1). "
+    "(2) Customer outbound trading over recent months: call query_customer_trade_summary once with "
+    "the task's customer_name (such as CUST-005) and months (use 3 when the user says three months "
+    "or prior three months unless another number is given). "
+    "Do not answer inventory or customer-trade questions from memory. "
+    "After a successful read-only tool call, stop calling tools and report what the tool returned."
+)
+
 AGENTS: dict[str, AgentSpec] = {
     "researcher": AgentSpec(
         name="researcher",
@@ -42,20 +53,28 @@ AGENTS: dict[str, AgentSpec] = {
     "ops": AgentSpec(
         name="ops",
         title="Ops / Support",
-        description="Takes customer-facing actions: looks up orders, issues refunds, sends "
-        "emails, creates tickets and escalates to a human. Sensitive actions may require "
-        "human approval.",
+        description="Meridian supply chain read queries (part inventory, customer trade summary), "
+        "replenishment, and customer-facing actions: order lookup, refunds, email, tickets, "
+        "escalation. Sensitive actions may require human approval.",
         tools=(
+            "query_part_inventory",
+            "query_customer_trade_summary",
+            "query_supplier_offers",
+            "submit_replenishment_for_approval",
+            "record_replenishment_choice",
             "lookup_order",
             "issue_refund",
             "send_email",
             "create_ticket",
             "escalate_to_human",
         ),
-        system_prompt=f"You are the Ops/Support agent. {_COMMON} Look up an order before "
-        "acting on it. Some actions are paused for human approval; if an action is rejected, "
-        "do not retry it - report the rejection instead. Escalate to a human when the "
-        "customer asks for a manager or when policy is unclear.",
+        system_prompt=f"You are the Ops/Support agent. {_COMMON} {_OPS_SUPPLY_READ} "
+        "For replenishment tasks, call submit_replenishment_for_approval with product_code, "
+        "warehouse_name, and qty_needed; do not hand-build request_replenishment_approval JSON. "
+        "Look up an order "
+        "before acting on customer orders. Some actions are paused for human approval; if an "
+        "action is rejected, do not retry it - report the rejection instead. Escalate to a human "
+        "when the customer asks for a manager or when policy is unclear.",
     ),
     "writer": AgentSpec(
         name="writer",
@@ -77,6 +96,14 @@ Specialists:
 Rules:
 - Delegate one specialist at a time with concrete instructions.
 - Do not call a specialist again unless its previous result was clearly incomplete.
+- Meridian read-only database questions belong to `ops` only: part inventory at a warehouse
+  (query_part_inventory) or customer shipment/trade/revenue over a month window
+  (query_customer_trade_summary). In `instructions`, name the tool and repeat exact codes from
+  the task (e.g. product_code HYD-08, warehouse_name WH-1, customer_name CUST-005, months=3).
+  Do not use `researcher`, `analyst`, or `writer` for these unless the user also asked for
+  calculations or external policy lookup.
+- After `ops` has completed a read-only supply chain tool call for such a task, choose FINISH
+  on the next step unless something is still missing.
 - Customer actions (refunds, emails, tickets, escalations) belong to `ops`; check policy with
   `researcher` first when a refund is involved.
 - Choose FINISH as soon as the work so far is sufficient to answer the user.

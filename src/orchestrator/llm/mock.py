@@ -16,6 +16,12 @@ from typing import Any
 from pydantic import BaseModel
 
 from orchestrator.agents.contracts import FinalAnswer, MemoryExtraction, MemoryItem, RouteDecision
+from orchestrator.supply_chain import (
+    build_replenishment_approval_args,
+    build_send_email_args_for_po,
+    is_purchase_order_dispatch_task,
+)
+from orchestrator.supply_chain.constants import DEFAULT_DB_PATH
 from orchestrator.llm.base import (
     LLMProvider,
     LLMResponse,
@@ -45,6 +51,8 @@ _WRITER_RE = re.compile(
 _SPECULATIVE_RE = re.compile(r"\b(forecast\w*|predict\w*|guess\w*|speculat\w*|next year)\b")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _ORDER_RE = re.compile(r"\b(ORD-\d{3,})\b", re.IGNORECASE)
+_PART_CODE_RE = re.compile(r"\b([A-Z]{3}-\d+)\b")
+_WAREHOUSE_RE = re.compile(r"\b(WH-\d+)\b", re.IGNORECASE)
 _AMOUNT_RE = re.compile(
     r"\$\s?(\d[\d,]*(?:\.\d{1,2})?)|(\d[\d,]*(?:\.\d{1,2})?)\s?(?:usd|dollars)\b"
 )
@@ -62,8 +70,101 @@ def _call_id(*parts: str) -> str:
     return f"call_{digest}"
 
 
+_CUSTOMER_RE = re.compile(r"\b(CUST-\d+)\b", re.IGNORECASE)
+
+
+def is_part_inventory_task(task: str) -> bool:
+    if is_replenishment_task(task):
+        return False
+    if not _PART_CODE_RE.search(task):
+        return False
+    t = task.lower()
+    return "inventory" in t or "warehouse" in t or bool(_WAREHOUSE_RE.search(task))
+
+
+def _requested_replenishment_approval(scratch: list[Message]) -> bool:
+    for message in scratch:
+        if message.role == "assistant" and message.tool_calls:
+            for call in message.tool_calls:
+                if call.name in (
+                    "request_replenishment_approval",
+                    "submit_replenishment_for_approval",
+                ):
+                    return True
+    return False
+
+
+def is_replenishment_task(task: str) -> bool:
+    if not _PART_CODE_RE.search(task):
+        return False
+    t = task.lower()
+    return "replenish" in t or ("leadership" in t and "approval" in t)
+
+
+def replenishment_qty(task: str) -> int:
+    match = re.search(r"\breplenish(?:ment)?\s+(\d+)\s*units?\b", task, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"\b(\d+)\s*units?\b", task, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return 200
+
+
+def is_customer_trade_task(task: str) -> bool:
+    if not _CUSTOMER_RE.search(task):
+        return False
+    t = task.lower()
+    return any(
+        phrase in t
+        for phrase in (
+            "trading",
+            "trade",
+            "shipment",
+            "revenue",
+            "three months",
+            "3 months",
+            "prior three",
+        )
+    )
+
+
+def _requested_send_email(scratch: list[Message]) -> bool:
+    for message in scratch:
+        if message.role == "assistant" and message.tool_calls:
+            for call in message.tool_calls:
+                if call.name == "send_email":
+                    return True
+    return False
+
+
+def _po_email_sent_summary(item: dict[str, Any]) -> str:
+    body = str(item.get("body") or "")
+    lines = [
+        "Operations summary:",
+        "",
+        "The following content was sent to procurement:",
+        "",
+        f"To: {item.get('to', '')}",
+        f"Subject: {item.get('subject', '')}",
+        "",
+        body,
+        "",
+        "Procurement will review release of this purchase order request.",
+    ]
+    return "\n".join(lines)
+
+
 def plan_agents(task: str) -> list[str]:
     """Which specialists a task needs, in delegation order."""
+    if is_purchase_order_dispatch_task(task):
+        return ["ops"]
+    if is_replenishment_task(task):
+        return ["ops"]
+    if is_part_inventory_task(task):
+        return ["ops"]
+    if is_customer_trade_task(task):
+        return ["ops"]
     t = task.lower()
     needed: set[str] = set()
     if _OPS_RE.search(t):
@@ -93,12 +194,123 @@ def extract_expressions(task: str) -> list[str]:
     return found
 
 
+def _leadership_decision_bullets(
+    scratch: list[Message], results: dict[str, list[dict[str, Any]]]
+) -> list[str]:
+    bullets: list[str] = []
+    seen: set[str] = set()
+
+    def add(line: str) -> None:
+        key = line.strip()
+        if key and key not in seen:
+            seen.add(key)
+            bullets.append(line)
+
+    for item in results.get("record_replenishment_choice", []):
+        if item.get("message"):
+            add(f"- {item['message']}")
+        elif item.get("status") == "recorded" and item.get("supplier_name"):
+            add(
+                f"- Leadership selected {item['supplier_name']} to replenish "
+                f"{item.get('qty_to_order', '?')} units of {item.get('product_code', 'part')} "
+                f"for {item.get('warehouse_name', 'warehouse')}."
+            )
+    for item in results.get("request_replenishment_approval", []):
+        if item.get("message"):
+            add(f"- {item['message']}")
+        elif item.get("status") == "recorded":
+            plan = item.get("plan") if isinstance(item.get("plan"), dict) else {}
+            summary = str(plan.get("summary") or "").strip()
+            if summary:
+                add(f"- Leadership approved plan: {summary}")
+    for msg in scratch:
+        if msg.role != "tool":
+            continue
+        try:
+            data = json.loads(msg.content)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("status") == "recorded" and data.get("message"):
+            add(f"- {data['message']}")
+        elif data.get("supplier_name") and data.get("qty_to_order"):
+            add(
+                f"- Leadership selected {data['supplier_name']} to replenish "
+                f"{data['qty_to_order']} units of {data.get('product_code', 'part')} "
+                f"for {data.get('warehouse_name', 'warehouse')}."
+            )
+    return bullets
+
+
+def _replenishment_ready_to_summarize(
+    ctx: PromptContext, results: dict[str, list[dict[str, Any]]]
+) -> bool:
+    if not is_replenishment_task(ctx.task):
+        return False
+    if "query_part_inventory" not in results or "query_supplier_offers" not in results:
+        return False
+    if _leadership_decision_bullets(ctx.scratch, results):
+        return True
+    if results.get("record_replenishment_choice"):
+        return True
+    for item in results.get("request_replenishment_approval", []):
+        if item.get("status") == "recorded" or item.get("message"):
+            return True
+    return False
+
+
+def _replenishment_operations_summary(
+    scratch: list[Message], results: dict[str, list[dict[str, Any]]]
+) -> str:
+    lines: list[str] = ["Operations summary:", ""]
+    for item in results.get("query_part_inventory", []):
+        if "product_code" not in item:
+            continue
+        below = item.get("below_reorder_point")
+        status = "below reorder point" if below else "at or above reorder point"
+        lines.append(
+            f"- {item['product_code']} @ {item['warehouse_name']} "
+            f"(snapshot {item['snapshot_date']}): "
+            f"on_hand={item['units_on_hand']}, reorder={item['reorder_point']}, "
+            f"reserved={item['units_reserved']}, "
+            f"in_transit={item['units_in_transit']}; {status}."
+        )
+    lines.append("")
+    for item in results.get("query_supplier_offers", []):
+        if "offers" not in item:
+            continue
+        product_code = item.get("product_code", "HYD-08")
+        count = item.get("offer_count", len(item.get("offers") or []))
+        lines.append(f"Supplier offers for {product_code} ({count} rows):")
+        for offer in item.get("offers") or []:
+            lines.append(
+                f"- {offer['supplier_name']}: qty_available={offer['qty_available']}, "
+                f"unit_price={offer['unit_price']}, lead_days={offer['lead_days']}"
+            )
+    lines.append("")
+    lines.append("Leadership decision:")
+    decision_bullets = _leadership_decision_bullets(scratch, results)
+    if decision_bullets:
+        lines.extend(decision_bullets)
+    else:
+        lines.append("- Leadership approval recorded (see audit for plan details).")
+    lines.append("")
+    lines.append(
+        "Procurement summary: leadership approval is on file. "
+        "No live purchase order is issued in this demo environment."
+    )
+    return "\n".join(lines)
+
+
 def _tool_results(scratch: list[Message]) -> dict[str, list[dict[str, Any]]]:
     """Map tool name -> list of parsed results already present in the scratchpad."""
     names: dict[str, str] = {}
     for msg in scratch:
         for call in msg.tool_calls:
             names[call.id] = call.name
+        if msg.role == "tool" and msg.tool_call_id and msg.name:
+            names.setdefault(msg.tool_call_id, msg.name)
     results: dict[str, list[dict[str, Any]]] = {}
     for msg in scratch:
         if msg.role == "tool" and msg.tool_call_id:
@@ -227,6 +439,54 @@ class MockProvider(LLMProvider):
     def _ops_plan(self, ctx: PromptContext) -> list[ToolCall]:
         task = ctx.task
         t = task.lower()
+        if is_replenishment_task(task):
+            part = _PART_CODE_RE.search(task)
+            warehouse = _WAREHOUSE_RE.search(task)
+            product_code = part.group(1) if part else "HYD-08"
+            warehouse_name = warehouse.group(1).upper() if warehouse else "WH-1"
+            return [
+                ToolCall(
+                    id=_call_id("inv", product_code, warehouse_name),
+                    name="query_part_inventory",
+                    args={
+                        "product_code": product_code,
+                        "warehouse_name": warehouse_name,
+                    },
+                ),
+                ToolCall(
+                    id=_call_id("offers", product_code),
+                    name="query_supplier_offers",
+                    args={"product_code": product_code},
+                ),
+            ]
+        if is_part_inventory_task(task):
+            part = _PART_CODE_RE.search(task)
+            warehouse = _WAREHOUSE_RE.search(task)
+            product_code = part.group(1) if part else "HYD-08"
+            warehouse_name = warehouse.group(1).upper() if warehouse else "WH-1"
+            return [
+                ToolCall(
+                    id=_call_id("inv", product_code, warehouse_name),
+                    name="query_part_inventory",
+                    args={
+                        "product_code": product_code,
+                        "warehouse_name": warehouse_name,
+                    },
+                )
+            ]
+        if is_customer_trade_task(task):
+            customer = _CUSTOMER_RE.search(task)
+            customer_name = customer.group(1).upper() if customer else "CUST-005"
+            months = 3
+            if re.search(r"\b(\d+)\s*months?\b", t):
+                months = int(re.search(r"\b(\d+)\s*months?\b", t).group(1))  # type: ignore[union-attr]
+            return [
+                ToolCall(
+                    id=_call_id("trade", customer_name, str(months)),
+                    name="query_customer_trade_summary",
+                    args={"customer_name": customer_name, "months": months},
+                )
+            ]
         plan: list[ToolCall] = []
         order = _ORDER_RE.search(task)
         order_id = order.group(1).upper() if order else None
@@ -299,14 +559,101 @@ class MockProvider(LLMProvider):
         self, ctx: PromptContext, results: dict[str, list[dict[str, Any]]]
     ) -> tuple[str, list[ToolCall]]:
         done_ids = {m.tool_call_id for m in ctx.scratch if m.role == "tool"}
+        if is_purchase_order_dispatch_task(ctx.task):
+            sent_items = [
+                item
+                for item in results.get("send_email", [])
+                if item.get("status") == "sent"
+            ]
+            if sent_items:
+                return _po_email_sent_summary(sent_items[-1]), []
+            if not _requested_send_email(ctx.scratch):
+                try:
+                    email_args = build_send_email_args_for_po(
+                        ctx.task, db_path=DEFAULT_DB_PATH
+                    )
+                except ValueError as exc:
+                    return (
+                        "Purchase order request cannot be executed.\n\n"
+                        f"{exc}\n\nNo email was drafted or sent."
+                    ), []
+                return "PO email drafted. Awaiting approval to send to procurement.", [
+                    ToolCall(
+                        id=_call_id(
+                            "po-email",
+                            email_args["supplier_name"],
+                            str(email_args["qty"]),
+                        ),
+                        name="send_email",
+                        args=email_args,
+                    )
+                ]
+        if is_replenishment_task(ctx.task):
+            if "record_replenishment_choice" not in results and not _requested_replenishment_approval(
+                ctx.scratch
+            ):
+                for call in self._ops_plan(ctx):
+                    if call.id not in done_ids:
+                        return f"Next action: {call.name}.", [call]
+            if (
+                "record_replenishment_choice" not in results
+                and "query_part_inventory" in results
+                and "query_supplier_offers" in results
+                and not _requested_replenishment_approval(ctx.scratch)
+            ):
+                part = _PART_CODE_RE.search(ctx.task)
+                warehouse = _WAREHOUSE_RE.search(ctx.task)
+                product_code = part.group(1) if part else "HYD-08"
+                warehouse_name = warehouse.group(1).upper() if warehouse else "WH-1"
+                qty = replenishment_qty(ctx.task)
+                return "Submit replenishment options for leadership approval.", [
+                    ToolCall(
+                        id=_call_id("repl-approval", product_code, str(qty)),
+                        name="submit_replenishment_for_approval",
+                        args={
+                            "product_code": product_code,
+                            "warehouse_name": warehouse_name,
+                            "qty_needed": qty,
+                        },
+                    )
+                ]
         for call in self._ops_plan(ctx):
             if call.id not in done_ids:
                 return f"Next action: {call.name}.", [call]
+        if _replenishment_ready_to_summarize(ctx, results):
+            return _replenishment_operations_summary(ctx.scratch, results), []
         lines = ["Operations summary:"]
         for name, items in results.items():
             for item in items:
                 status = item.get("status", "ok")
-                if name == "lookup_order" and "order" in item:
+                if name == "query_part_inventory" and "product_code" in item:
+                    below = item.get("below_reorder_point")
+                    status = "below reorder point" if below else "at or above reorder point"
+                    lines.append(
+                        f"- {item['product_code']} @ {item['warehouse_name']} "
+                        f"(snapshot {item['snapshot_date']}): "
+                        f"on_hand={item['units_on_hand']}, reorder={item['reorder_point']}, "
+                        f"reserved={item['units_reserved']}, "
+                        f"in_transit={item['units_in_transit']}; {status}."
+                    )
+                elif name == "query_supplier_offers" and "offers" in item:
+                    lines.append(f"- Supplier offers for {item['product_code']} ({item['offer_count']} rows):")
+                    for offer in item["offers"]:
+                        lines.append(
+                            f"  - {offer['supplier_name']}: qty_available={offer['qty_available']}, "
+                            f"unit_price={offer['unit_price']}, lead_days={offer['lead_days']}"
+                        )
+                elif name == "record_replenishment_choice" and item.get("status") == "recorded":
+                    lines.append(f"- {item.get('message', 'Replenishment choice recorded.')}")
+                elif name == "query_customer_trade_summary" and "customer_name" in item:
+                    period = f"{item['period_start']} to {item['period_end']}"
+                    lines.append(
+                        f"- {item['customer_name']} ({period}): "
+                        f"shipments={item['shipment_count']}, "
+                        f"qty_shipped={item['total_qty_shipped']}, "
+                        f"revenue=${item['total_revenue']:,.2f}."
+                    )
+                elif name == "lookup_order" and "order" in item:
                     order = item["order"]
                     lines.append(
                         f"- Order {order['order_id']}: {order['status']}, "
@@ -329,7 +676,10 @@ class MockProvider(LLMProvider):
                     if status == "rejected_by_human":
                         lines.append("- Email was NOT sent: rejected by a reviewer.")
                     elif "message_id" in item:
-                        lines.append(f"- Email {item['message_id']} sent to {item['to']}.")
+                        if item.get("purpose") == "purchase_order_dispatch" and item.get("body"):
+                            lines.extend(_po_email_sent_summary(item).splitlines()[2:])
+                        else:
+                            lines.append(f"- Email {item['message_id']} sent to {item['to']}.")
                     else:
                         lines.append(f"- Email failed: {item.get('error', status)}")
                 elif name == "create_ticket" and "ticket_id" in item:

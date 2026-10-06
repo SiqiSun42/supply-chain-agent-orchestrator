@@ -28,6 +28,7 @@ def settings(tmp_path: Path) -> Settings:
         chroma_collection=f"test_{uuid.uuid4().hex[:12]}",
         llm_provider="mock",
         redis_url=None,
+        long_term_memory_enabled=True,
     )
 
 
