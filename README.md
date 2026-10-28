@@ -1,310 +1,157 @@
 # Agent Orchestrator
 
-**A production-shaped multi-agent system: a LangGraph supervisor delegates to specialist agents that use typed tools, remember users across conversations, and pause for a human whenever an action is risky.**
+**面向工业供应链采购场景的多智能体决策系统：中枢节点按任务语义路由至专职智能体，工具调用全程类型校验，需人工介入的步骤挂起后可跨进程恢复执行。**
 
-[![CI](https://github.com/aqkprogrammer/agent-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/aqkprogrammer/agent-orchestrator/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12-3776AB)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.x-1C3C3C)
 ![React](https://img.shields.io/badge/React-19-61DAFB)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-Most agent demos stop at "the LLM called a function". This project shows the parts that make agents shippable: **durable execution** (every step is checkpointed in Postgres, so a run can pause for hours and resume in a different process), **human-in-the-loop approvals** driven by an explicit risk policy, **long-term memory** with semantic recall, **an audit trail** of every tool call, and **live observability** of each agent step streamed to a React console.
-
-It runs fully offline out of the box. A deterministic mock LLM and a hashing embedder exercise every feature without API keys. Set one environment variable to switch to Claude (`claude-sonnet-5`) or OpenAI.
-
-![A supervisor delegates to specialists; a $250 refund and an outbound email were approved by a human before the run completed](docs/screenshots/completed-run.png)
+基于 LangGraph 构建，业务数据落在关系库中，模型只负责任务路由与语言组织，数值核算与方案筛选由确定性代码完成。默认以脚本化 mock 推理层运行，无需任何 API Key 即可跑通全部链路；设置环境变量后可切换到 DeepSeek 等 OpenAI 兼容服务或 Anthropic。
 
 ---
 
-## Features
+## 业务场景
 
-| | |
+当前覆盖四条端到端链路，均可在 Console 中一键发起：
+
+| 任务 | 链路 |
 |---|---|
-| **Supervisor delegation** | A supervisor LLM routes work to a *Researcher*, *Analyst*, *Ops/Support* agent and *Writer*, one at a time, with loop limits (max delegations, max visits per agent, max tool rounds). A *Finalizer* step then combines their results. |
-| **Typed tool use** | 10 tools with pydantic argument schemas (exported as JSON Schema to the model): knowledge-base search (BM25), a safe AST-based calculator (no `eval`), current time, memory save/recall, order lookup, tickets, refunds, outbound email, escalation. Invalid arguments are returned to the model as recoverable errors. |
-| **Human-in-the-loop** | A `RiskPolicy` decides what needs a human: refunds above a threshold, all outbound email, explicit escalations, and low-confidence final answers. The graph calls LangGraph `interrupt()`, the run becomes `awaiting_approval`, and a reviewer can **approve, reject or edit** the action (edited arguments are re-validated). The run resumes from its checkpoint with `Command(resume=...)`. Several approvals in one run are chained. |
-| **Persistent memory** | *Short-term*: thread state (conversation turns) in the LangGraph checkpointer (Postgres). *Long-term*: facts extracted after each run are stored in Postgres (the source of truth, deduplicated per user) and embedded into ChromaDB. At the start of each run, relevant memories are recalled by semantic search, together with the user's profile and preference facts. Each user has their own memory namespace. You can browse, search, add and delete memories. |
-| **Async execution** | The API only enqueues. Celery workers (Redis broker) execute graphs and publish events over Redis pub/sub. A no-infra mode runs graphs in an in-process thread pool instead. |
-| **Real-time streaming** | Server-Sent Events replay the stored history and then stream live events, with resume via `Last-Event-ID`. Events cover routing decisions, agent start/finish, every LLM call (tokens and latency), tool calls and results, approvals, and memory reads and writes. |
-| **Audit & tracing** | Every tool execution, rejection and error is written to an `audit_log` table with arguments, result, status, agent and latency. The run history shows token and latency totals per run and per agent. |
-| **React console** | A chat-style task view with a live agent timeline, an approvals inbox, a memory browser, run history and a per-run trace view. |
-| **Operational basics** | Liveness and readiness probes, structured JSON logging (structlog), `pydantic-settings` configuration, multi-stage non-root Docker images with healthchecks, and CI. |
+| 零件库存查询 | 路由至 ops → 读库存快照 → 汇总答复 |
+| 客户近三月交易汇总 | 路由至 ops → 聚合出库与收入 → 汇总答复 |
+| 补货申请（需审批） | 读库存与多供应商报价 → 服务端组装方案 → **人工审批** → 记录选定方案 |
+| 采购单外发（需审批） | 校验供应商可售量 → 生成采购邮件 → **人工审批** → 发送 |
 
----
+另保留三条框架能力演示任务（人工升级、低置信度终审、长期记忆召回）。
 
-## Architecture
+## 数据
 
-```mermaid
-flowchart LR
-    subgraph Browser
-        UI["React console<br/>(Vite + TS + Tailwind)"]
-    end
+业务库为独立 SQLite（`data/supply_chain.db`），由 `archive/` 下的 Meridian 供应链数据集导入，共 12 张表、约 4.5 万行：
 
-    subgraph Edge
-        NGINX["nginx<br/>static UI + /api proxy"]
-    end
+- **本企业侧**：物料、仓库、客户、库存快照、历史采购单与出货单等。
+- **供应商侧**：`supplier_offer` 表记录各供应商**当前**可售量、单价与交期，共 393 行（20 家供应商覆盖 40 个物料，含零库存行）。该表由历史采购记录推导生成，每次查询即取最新值，不含时间序列。
+- 库存类查询以固定业务日期 `2026-01-01` 为基准，取该日期之前最近一次快照。
 
-    subgraph Backend
-        API["FastAPI<br/>REST + SSE"]
-        W1["Celery worker(s)<br/>LangGraph runtime"]
-    end
-
-    subgraph Data
-        PG[("PostgreSQL<br/>runs · events · approvals<br/>memories · audit_log<br/>LangGraph checkpoints")]
-        R[("Redis<br/>Celery broker<br/>event pub/sub")]
-        C[("ChromaDB<br/>memory embeddings")]
-    end
-
-    LLM{{"LLM provider<br/>Anthropic · OpenAI · mock"}}
-
-    UI -- "HTTP / EventSource" --> NGINX --> API
-    API -- "enqueue run / resume" --> R
-    R -- "task" --> W1
-    W1 -- "publish events" --> R
-    R -- "subscribe" --> API
-    API <--> PG
-    W1 <--> PG
-    W1 <--> C
-    API <--> C
-    W1 <--> LLM
-```
-
-### Agent graph
-
-```mermaid
-flowchart TD
-    START([start]) --> intake["intake<br/>recall long-term memory"]
-    intake --> supervisor{"supervisor<br/>route or FINISH"}
-    supervisor --> researcher["researcher<br/>knowledge_search · recall_memory"]
-    supervisor --> analyst["analyst<br/>calculator · current_time"]
-    supervisor --> ops["ops<br/>lookup_order · issue_refund · send_email<br/>create_ticket · escalate_to_human"]
-    supervisor --> writer["writer"]
-    researcher --> supervisor
-    analyst --> supervisor
-    writer --> supervisor
-    ops -- "safe tools" --> supervisor
-    ops -- "risky tool call" --> review[["human_review<br/>interrupt()"]]
-    review -- "approve / edit / reject<br/>Command(resume=...)" --> ops
-    review -- "next pending action" --> review
-    supervisor -- "FINISH or loop limit" --> finalize["finalize<br/>answer + confidence"]
-    finalize -- "confidence < threshold" --> review
-    review -- "final answer reviewed" --> memorize
-    finalize --> memorize["memorize<br/>extract facts to Postgres + Chroma"]
-    memorize --> END([end])
-```
-
-The live topology is also exposed at `GET /api/graph` (Mermaid source generated by LangGraph).
-
-### Lifecycle of a run
-
-1. `POST /api/runs` creates a thread (or continues one), stores the run as `queued`, emits `run_queued` and dispatches it to Celery (or to the inline pool).
-2. A worker atomically claims the run (`queued → running`) and streams the graph with thread-scoped checkpointing.
-3. Nodes emit events. Each event is written to Postgres **before** it is published to Redis, so SSE clients subscribe first, replay from the database, and then follow the live stream without gaps.
-4. When a node calls `interrupt()`, the worker records an approval (kind, tool, arguments, reason, risk) and marks the run `awaiting_approval`. The worker is then free for other work.
-5. `POST /api/approvals/{id}/decision` validates the decision, atomically moves the approval and the run back to `queued`, and dispatches a resume. The next worker resumes from the Postgres checkpoint with `Command(resume=decision)`.
-6. The run ends with `run_completed`, or with `run_failed` carrying the error. Token and latency totals are accumulated across every pause and resume segment.
-
----
-
-## See it in action
-
-These screenshots come from a local run with `make dev`, using the scripted mock LLM, SQLite and embedded Chroma. No API keys or containers are needed.
-
-**1. Give the team a task.** Click the example **"Refund + email (needs approval)"**:
-
-> *My name is Dana and I prefer concise answers. Order ORD-1042 arrived damaged - please refund $250 and email me at dana@example.com to confirm.*
-
-The run proceeds like this, and the **Agent timeline** on the right streams every step live:
-
-1. The supervisor routes the task to the **Researcher**, which searches the knowledge base for the refund policy and recalls memories.
-2. The supervisor then routes to **Ops**, which looks up the order and prepares `issue_refund`.
-3. The risk policy flags the refund because $250 is above the $100 auto-approval limit. The graph calls LangGraph `interrupt()`, the state is checkpointed, and the run pauses with status **Needs approval**.
-
-![The refund pauses for human approval with the exact tool arguments shown](docs/screenshots/approval.png)
-
-**2. Approve, edit or reject.** The approval card shows the exact tool arguments. You can approve them, edit them (for example, change the amount), or reject with a comment.
-
-1. After you click **Approve**, the run resumes from its checkpoint.
-2. The refund is issued, and then `send_email` pauses for its own review.
-3. After the second approval, the run completes with a final answer, a confidence score, token and latency totals, and a link to the full trace. The screenshot at the top of this README shows this state.
-
-**3. Memory carries across conversations.** At the end of the run, two long-term memories are extracted: *"User's name is Dana"* and *"User prefers concise answers"*. They are stored in the database and embedded in Chroma. You can view, search, add or delete them on the **Memory** page.
-
-![Long-term memories extracted from the first conversation](docs/screenshots/memory.png)
-
-Start a **new conversation** and pick **"Memory recall"** (*"Write a short welcome note for me."*). The run recalls both memories semantically before planning, and the writer greets Dana by name.
-
-![A new conversation recalls the user's name and preference](docs/screenshots/memory-recall.png)
-
-**4. Everything is auditable.** **Run history** lists every run with its token usage, LLM and tool call counts, and latency. Click a run to open its full step-by-step trace.
-
-![Run history with tokens, calls and latency](docs/screenshots/runs.png)
-
-The same flow can be driven from the terminal with `./scripts/demo.sh http://localhost:8000`.
-
-## Quickstart
-
-### 1. Local, no infrastructure (about 1 minute)
-
-Requirements: [uv](https://docs.astral.sh/uv/) and Node 20+ (uv downloads Python 3.12 for you).
+重建业务库：
 
 ```bash
-make install        # uv sync + npm ci
-make dev            # API on :8000 (mock LLM, SQLite, embedded Chroma) + UI on :5173
+uv run python scripts/load_supply_chain.py
 ```
 
-Open http://localhost:5173 and click **"Refund + email (needs approval)"**. You will see the supervisor delegate, the tools run, and two approval requests appear inline. Approve or reject them, then start **"Memory recall"** in a new conversation. The agents greet you by the name they remembered.
+## 快速开始
 
-Prefer the terminal? With the API running:
+依赖 [uv](https://docs.astral.sh/uv/) 与 Node 20+。
 
 ```bash
-./scripts/demo.sh http://localhost:8000
+make install    # uv sync + npm ci
+make dev        # API :8000（mock 推理 + SQLite）+ UI :5173
 ```
 
-This drives the full flow over HTTP: delegation, tool calls, two approvals, the resume, the trace, and memory recall in a second thread.
+打开 http://localhost:5173，点击预制任务「Replenish HYD-08: leadership approval」，可以看到中枢节点派发、工具执行、审批卡片内联出现；通过或驳回后任务从断点继续。
 
-### 2. Full stack with Docker
-
-```bash
-cp .env.example .env    # optional: set LLM_PROVIDER / API keys
-make up                 # postgres, redis, chroma, api, worker, frontend
-open http://localhost:8080
-```
-
-Ports are configurable if 8000 or 8080 are already taken: `API_PORT=18000 UI_PORT=18080 docker compose up -d`. Stop and wipe the stack with `make down`.
-
-### 3. Real models
+切换真实模型：
 
 ```bash
-# Anthropic (default model: claude-sonnet-5)
+# OpenAI 兼容服务（DeepSeek 等）
+LLM_PROVIDER=openai OPENAI_API_KEY=sk-... OPENAI_BASE_URL=https://api.deepseek.com OPENAI_MODEL=deepseek-chat make dev
+# Anthropic
 LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... make dev
-# OpenAI
-LLM_PROVIDER=openai OPENAI_API_KEY=sk-... OPENAI_MODEL=gpt-5-mini make dev
-# Optional: use a different model for routing, and real embeddings
-SUPERVISOR_MODEL=claude-haiku-4-5 EMBEDDING_PROVIDER=openai
 ```
 
-> If you switch `EMBEDDING_PROVIDER`, also change `CHROMA_COLLECTION` (or wipe `data/`). Vectors of different dimensions cannot share a collection.
+完整 Docker 栈（Postgres、Redis、Chroma、API、worker、UI）：`make up`，随后访问 http://localhost:8080，`make down` 停止并清理。
 
 ---
 
-## Configuration
+## 设计要点
 
-All settings are environment variables (see [`.env.example`](.env.example)).
+**路由约束**。中枢节点的决策是结构化输出，取值被限制在四个专职智能体（信息检索、数值分析、业务执行、结果撰写）与 FINISH 构成的闭集内；每个智能体只注册属于自己的工具子集，派发错误时也无法触达采购类工具。委派轮数、单智能体访问次数、工具调用轮次三层上限约束路由空间，最坏情况是提前收敛而非无限循环。
 
-| Variable | Default | Description |
+**工具契约**。16 个工具的参数以 Pydantic 建模并导出为 JSON Schema，调用前强制校验，校验失败作为可恢复错误回传模型重试。补货场景中模型只传物料、仓库、数量三个语义参数，完整审批载荷由服务端依库存与报价确定性组装，避免模型手工拼装长 JSON。
+
+**人工审批与恢复**。风险策略（而非模型）决定哪些步骤需要人工介入：采购类审批、外发邮件、超额退款、显式升级、低置信度终答。触发时执行图挂起并将运行状态落盘，接口层仅入队、由工作进程携带人工决策在另一进程续跑，单任务内多次中断可链式串联。中断点位于工具调用中途时，恢复前重建消息序列，保证模型侧 `tool_calls` 与工具返回严格配对。状态流转采用原子条件转移，重复提交的审批决定不会导致工具二次执行。
+
+**采购审批交互**。补货审批不是单一动作的通过或拒绝：审批卡片展示数据事实、分析结论、推荐方案与备选方案（含跨供应商拆单），驳回后可选择备选方案或自由填写，修订后重新进入审批，直到通过才恢复执行图。
+
+**可观测与审计**。每次工具执行、拒绝与报错写入审计表（入参、返回、状态、所属智能体、耗时）；步骤级事件先落库再发布，前端通过 SSE 先重放历史再跟随实时流，断线按 `Last-Event-ID` 续播，因此任意一次运行都可逐条回放。
+
+---
+
+## 配置
+
+全部配置通过环境变量提供，详见 [`.env.example`](.env.example)。常用项：
+
+| 变量 | 默认值 | 说明 |
 |---|---|---|
-| `LLM_PROVIDER` | `mock` | `mock` (offline, deterministic), `anthropic` or `openai` |
-| `ANTHROPIC_MODEL` / `OPENAI_MODEL` | `claude-sonnet-5` / `gpt-5-mini` | Worker and finalizer model |
-| `SUPERVISOR_MODEL` | unset | Optional separate model for routing |
-| `EMBEDDING_PROVIDER` | `hashing` | `hashing` (offline) or `openai` |
-| `DATABASE_URL` | `sqlite:///./data/orchestrator.db` | SQLAlchemy URL; use `postgresql+psycopg://...` in production |
-| `CHECKPOINTER` | `auto` | `postgres`, `sqlite` or `memory`; `auto` follows `DATABASE_URL` |
-| `RUN_EXECUTOR` | `inline` | `celery` (Redis + workers) or `inline` (in-process thread pool) |
-| `REDIS_URL` | unset | Celery broker and event bus |
-| `EVENT_BUS` | `auto` | `redis` or `memory`; `auto` picks Redis when `REDIS_URL` is set |
-| `VECTOR_STORE` | `chroma` | `chroma` or `memory` |
-| `CHROMA_MODE` | `persistent` | `persistent` (embedded), `http` (server) or `ephemeral` |
-| `MAX_SUPERVISOR_STEPS` | `6` | Maximum delegations per run before forcing the final answer |
-| `MAX_AGENT_VISITS` | `2` | Maximum times the supervisor may call the same agent |
-| `MAX_TOOL_ROUNDS` | `4` | Maximum LLM↔tool round trips inside one agent turn |
-| `REFUND_APPROVAL_THRESHOLD` | `100` | Refunds above this amount (USD) need approval |
-| `EMAIL_REQUIRES_APPROVAL` | `true` | Outbound email needs approval |
-| `CONFIDENCE_THRESHOLD` | `0.55` | Final answers below this confidence go to review |
-| `MEMORY_RECALL_K` / `MEMORY_MIN_SCORE` | `5` / `0.12` | Semantic recall depth and similarity cutoff |
-| `LOG_FORMAT` | `console` | `console` or `json` |
+| `LLM_PROVIDER` | `mock` | `mock` / `openai` / `anthropic` |
+| `OPENAI_BASE_URL` | 未设置 | 指向 OpenAI 兼容服务；设置后结构化输出降级为 `json_object` |
+| `OPENAI_MODEL` / `ANTHROPIC_MODEL` | `gpt-5-mini` / `claude-sonnet-5` | 执行与终答模型 |
+| `SUPERVISOR_MODEL` | 未设置 | 可为路由单独指定模型 |
+| `SUPPLY_CHAIN_DB_PATH` | `./data/supply_chain.db` | 业务库路径 |
+| `DATABASE_URL` | `sqlite:///./data/orchestrator.db` | 运行记录库；生产可换 `postgresql+psycopg://...` |
+| `CHECKPOINTER` | `auto` | `postgres` / `sqlite` / `memory` |
+| `RUN_EXECUTOR` | `inline` | `inline` 进程内线程池，或 `celery` |
+| `MAX_SUPERVISOR_STEPS` | `6` | 单次运行最大委派轮数 |
+| `MAX_AGENT_VISITS` | `2` | 同一智能体最大访问次数 |
+| `MAX_TOOL_ROUNDS` | `4` | 单个智能体回合内最大工具往返次数 |
+| `CONFIDENCE_THRESHOLD` | `0.55` | 终答置信度低于此值转人工复核 |
+| `EMAIL_REQUIRES_APPROVAL` | `true` | 外发邮件需审批 |
+| `LONG_TERM_MEMORY_ENABLED` | `false` | 长期记忆（Chroma 语义召回） |
 
----
+复杂任务建议上调三层上限，例如 `MAX_SUPERVISOR_STEPS=10 MAX_AGENT_VISITS=3 MAX_TOOL_ROUNDS=8`。
 
-## API reference
+## 接口
 
-Interactive OpenAPI docs are at `/docs`.
+交互式文档位于 `/docs`。主要端点：
 
-| Method & path | Description |
+| 方法与路径 | 说明 |
 |---|---|
-| `GET /health` | Liveness |
-| `GET /health/ready` | Readiness: database, event bus, vector store, checkpointer (503 if degraded) |
-| `GET /api/config` | Provider, infrastructure, limits, risk policy, agents and tool schemas |
-| `GET /api/graph` | Mermaid source of the compiled LangGraph |
-| `POST /api/runs` | Start a run: `{task, user_id, thread_id?}` → `202` with the run (409 if the thread is busy) |
-| `GET /api/runs` | List runs (`user_id`, `thread_id`, `status`, `limit`, `offset`) |
-| `GET /api/runs/{id}` | Run detail, including `pending_approval` |
-| `GET /api/runs/{id}/events` | Stored trace events (`after` cursor) |
-| `GET /api/runs/{id}/stream` | **SSE**: replay and live events; honours `Last-Event-ID` |
-| `GET /api/runs/{id}/audit` | Tool audit log for the run |
-| `GET /api/threads` · `GET /api/threads/{id}` | Threads; detail includes runs and checkpointed conversation |
-| `GET /api/approvals` | Approvals inbox (`status`, `user_id`, `run_id`) |
-| `POST /api/approvals/{id}/decision` | `{decision: approve\|reject\|edit, args?, response?, comment?, reviewer?}` |
-| `GET /api/memories` | List memories, or semantic search with `q=` |
-| `POST /api/memories` · `DELETE /api/memories/{id}` | Add / delete a long-term memory |
-| `GET /api/audit` | Global audit log |
+| `POST /api/runs` | 发起任务 `{task, user_id, thread_id?}` |
+| `GET /api/runs/{id}` | 运行详情，含待处理审批 |
+| `GET /api/runs/{id}/stream` | SSE：历史重放 + 实时事件 |
+| `GET /api/runs/{id}/audit` | 该次运行的工具审计记录 |
+| `GET /api/approvals` | 审批收件箱 |
+| `POST /api/approvals/{id}/decision` | `approve` / `reject` / `revise` / `edit` |
+| `GET /api/config` · `GET /api/graph` | 运行配置、风险策略、工具 Schema；执行图结构 |
+| `GET /health/ready` | 就绪探针（数据库、事件总线、向量库、checkpointer） |
 
-Example:
+## 目录结构
+
+```
+src/orchestrator/
+├── agents/          # 执行图、智能体名册与提示、风险策略、工具执行器
+├── supply_chain/    # 业务查询、补货决策引擎、采购单外发、数据导入与报价生成
+├── llm/             # 提供方接口、OpenAI/Anthropic 适配、脚本化 mock、消息修复与 JSON 解析
+├── api/             # FastAPI 应用与路由
+├── db/              # SQLAlchemy 模型与仓储
+├── runtime/         # 运行与恢复、派发、事件总线、checkpointer、容器
+├── tools/           # 工具框架与内置工具
+└── config.py        # pydantic-settings 配置
+frontend/            # React + Vite + TypeScript 控制台
+spec/                # 分阶段改造说明与采购审批交互规范
+tests/               # 离线测试（101 项）
+```
+
+## 开发
 
 ```bash
-curl -X POST localhost:8000/api/runs -H 'content-type: application/json' \
-  -d '{"task": "Refund $250 on ORD-1042", "user_id": "dana"}'
-curl -N localhost:8000/api/runs/<run_id>/stream
-curl -X POST localhost:8000/api/approvals/<approval_id>/decision -H 'content-type: application/json' \
-  -d '{"decision": "edit", "args": {"order_id": "ORD-1042", "amount": 120, "reason": "partial refund"}}'
-```
-
----
-
-## Design decisions and trade-offs
-
-- **Human review is its own node, not a side effect inside a tool.** LangGraph re-executes the interrupted node from the top when it resumes. The pause therefore lives in a small `human_review` node with no side effects before `interrupt()`. Worker nodes are never replayed, so the model is not called twice and tools do not run twice. Tool calls in the same model turn that follow a paused call are carried in `pending_action.remaining`, so chained approvals keep the tool_use/tool_result pairing that providers require.
-- **The policy is outside the model.** The LLM *proposes* actions. A deterministic `RiskPolicy` decides what needs a human, so prompt injection cannot talk the system out of an approval.
-- **Postgres is the source of truth for memory, and Chroma is an index.** Memories are deduplicated by content hash per user, and deletes remove both copies. If the vector index is lost, it can be rebuilt from SQL.
-- **Recall combines profile facts with semantic hits.** Profile and preference facts, such as a name or a tone preference, are always relevant but rarely lexically similar to the task. They are always included, and other facts must pass a similarity threshold.
-- **Events are persisted before they are published.** The stream has at-least-once semantics and is deduplicated by event id. Subscribing before replaying closes the race between the database and pub/sub.
-- **Provider-neutral LLM interface.** Agents depend on a two-method interface (`chat` with tools, `structured` output). Anthropic and OpenAI adapters use the official SDKs directly. The Anthropic adapter replays provider-native content blocks (for example thinking blocks) within a tool loop. The mock provider receives a structured `PromptContext` instead of parsing prose, which keeps it deterministic and easy to follow.
-- **Atomic state transitions** (`queued → running`, `pending → decided`) guard against double execution from duplicate Celery deliveries or double-clicked approvals.
-- **Trade-offs.** A graph is compiled per execution, which is cheap and keeps dependencies explicit. The schema is created with `create_all` and there are no migrations yet. The event log grows without bound. Users are identified by a plain `user_id`, and there is no authentication.
-
----
-
-## Project structure
-
-```
-agent-orchestrator/
-├── src/orchestrator/
-│   ├── agents/          # graph.py (LangGraph), specs (roster + prompts), policy, tool executor, contracts
-│   ├── api/             # FastAPI app, routes (runs, approvals, memories, threads, system), schemas
-│   ├── db/              # SQLAlchemy models, session, repository
-│   ├── llm/             # provider interface, Anthropic, OpenAI, deterministic mock, factory
-│   ├── memory/          # embedders, vector indexes (Chroma / in-memory), MemoryStore
-│   ├── runtime/         # runner (execute/resume), dispatch (Celery/inline), events (SSE bus), checkpointer, container
-│   ├── tools/           # tool framework, built-in tools, safe calculator, BM25 knowledge base (+ markdown KB)
-│   ├── worker/          # Celery app + tasks
-│   └── config.py        # pydantic-settings
-├── tests/               # unit, graph and API tests (offline)
-├── frontend/            # React + Vite + TypeScript + Tailwind console; nginx.conf; Dockerfile
-├── scripts/demo.sh      # curl-driven end-to-end demo
-├── Dockerfile           # API/worker image (multi-stage, uv, non-root)
-├── docker-compose.yml   # postgres, redis, chroma, api, worker, frontend
-└── Makefile
-```
-
-## Development
-
-```bash
-make test        # pytest, fully offline (SQLite, embedded Chroma, mock LLM, eager Celery)
-make lint        # ruff check + ruff format --check + eslint
+make test        # pytest，全离线
+make lint        # ruff + eslint
 make typecheck   # mypy --strict + tsc
-make check       # everything CI runs
+make check       # CI 全量检查
 ```
 
-The test suite covers the calculator's safety guarantees, tool validation, the risk policy, memory deduplication, isolation and recall, the provider adapters (with fake SDK clients), the graph (delegation, loop limits, failure handling, short-term memory) and the full HTTP flow. That includes **interrupt → approve/edit/reject → resume**, chained approvals, escalations, low-confidence review, SSE replay, and runs dispatched through Celery in eager mode.
+测试覆盖工具参数校验、风险策略、执行图（委派、上限、失败处理）、补货与采购链路、审批中断与恢复、提供方适配与消息修复，以及完整 HTTP 流程。
 
-## Roadmap
+## 现状与计划
 
-- Alembic migrations and retention for `run_events`
-- Authentication and RBAC for reviewers (who may approve what), with approval SLAs and notifications
-- Token streaming of the final answer, and cancellation of in-flight runs
-- Parallel fan-out (`Send`) for independent research subtasks
-- Evaluation harness (golden tasks, LLM-as-judge) and OpenTelemetry traces
-- Memory consolidation: merge or expire conflicting facts, and let users edit memories
+已完成：库存与交易查询、单物料补货审批、采购单外发审批，mock 与真实 API 两条路径均可端到端运行；供应商报价数据已扩充至 20 家。
+
+计划中：
+
+- 采购单生命周期模拟（供应商确认、发货、签收、延误）与库存联动写入
+- 多物料联合采购引擎：批量扫描低于补货点的物料，生成含同供应商凑单、运费与折扣关联的整单方案
+- 后端定时调度与访问鉴权
+- 文档截图更新
 
 ## License
 
